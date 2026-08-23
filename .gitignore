@@ -1,3 +1,11 @@
 .vscode/
 
+.examples/
+.build/
+.build*/
+
+
 tmp/
+build/
+build*/
+
