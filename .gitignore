@@ -10,7 +10,7 @@ build/
 build*/
 
 __pycache__/
-mounts.json
+mounts*.json
 
 *.code-workspace
 

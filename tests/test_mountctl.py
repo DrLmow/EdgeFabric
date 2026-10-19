@@ -12,27 +12,40 @@ def identity(target, token, mount_id="10"):
     return dict(zip(m.IDENTITY_KEYS, [mount_id, "1", "0:42", "/", str(target), "fuse." + token, "bindfs"] ))
 
 
+def native_identity(target, source, mount_id="10"):
+    return dict(zip(m.IDENTITY_KEYS, [mount_id, "1", "0:42", str(source), str(target), "ext4", "/dev/test"]))
+
+
 class FakeBackend:
     def __init__(self):
         self.actual = {}
         self.calls = []
         self.busy = set()
         self.fail_mount = False
+        self.sources = {}
 
     def mounts(self):
         return copy.deepcopy(self.actual)
 
-    def mount(self, source, target, token):
+    def preflight(self, actions):
+        pass
+
+    def mount(self, source, target):
         self.calls.append(("mount", source, target))
         if self.fail_mount:
             raise m.MountError("mount failed")
-        self.actual[target] = [identity(target, token)]
+        self.actual[target] = [native_identity(target, source)]
+        self.sources[target] = source
+
+    def samefile(self, source, target):
+        return self.sources.get(target) == source
 
     def unmount(self, target):
         self.calls.append(("unmount", target))
         if target in self.busy:
             raise m.MountError("Device or resource busy")
         del self.actual[target]
+        self.sources.pop(target, None)
 
 
 class MemoryStore:
@@ -74,6 +87,16 @@ class MountctlTests(unittest.TestCase):
         records = {}
         self.execute(self.desired(), records)
         return records
+
+    def mount_legacy(self):
+        self.target.mkdir(exist_ok=True)
+        token = m.TOKEN_PREFIX + "a" * 32
+        actual = identity(self.target, token)
+        self.backend.actual[str(self.target)] = [actual]
+        return {str(self.target): {
+            "source": str(self.source), "target": str(self.target),
+            "token": token, "mount": copy.deepcopy(actual),
+        }}
 
     def execute(self, desired, records):
         plan = m.make_plan(desired, records, self.backend.mounts())
@@ -206,18 +229,57 @@ class MountctlTests(unittest.TestCase):
         self.assertEqual(self.execute(self.desired(), records), 0)
         self.assertEqual(len(self.backend.calls), 2)
 
-    def test_interrupted_mount_recovers_from_unique_token(self):
+    def test_interrupted_native_mount_requires_manual_confirmation(self):
         records = self.mount_initial()
         records[str(self.target)]["mount"] = None
+        with self.assertRaises(m.MountError):
+            self.execute(self.desired(), records)
+        self.assertEqual(len(self.backend.calls), 1)
+        self.backend.unmount(str(self.target))
         self.assertEqual(self.execute(self.desired(), records), 0)
         self.assertIsNotNone(records[str(self.target)]["mount"])
-        self.assertEqual(len(self.backend.calls), 1)
 
-    def test_interrupted_mount_can_be_removed(self):
-        records = self.mount_initial()
+    def test_legacy_interrupted_mount_can_be_removed_using_its_unique_token(self):
+        records = self.mount_legacy()
         records[str(self.target)]["mount"] = None
         self.assertEqual(self.execute({}, records), 0)
         self.assertFalse(records)
+
+    def test_existing_fuse_mount_is_replaced_by_native_bind(self):
+        records = self.mount_legacy()
+        self.assertEqual(self.execute(self.desired(), records), 0)
+        self.assertEqual(self.backend.calls, [
+            ("unmount", str(self.target)), ("mount", str(self.source), str(self.target)),
+        ])
+        self.assertEqual(records[str(self.target)]["backend"], "bind")
+        self.assertNotIn("token", records[str(self.target)])
+        self.assertEqual(records[str(self.target)]["mount"]["fstype"], "ext4")
+
+    def test_busy_legacy_mount_is_not_replaced(self):
+        records = self.mount_legacy()
+        before = copy.deepcopy(records)
+        self.backend.busy.add(str(self.target))
+        self.assertGreater(self.execute(self.desired(), records), 0)
+        self.assertEqual(records, before)
+        self.assertEqual(self.backend.calls, [("unmount", str(self.target))])
+
+    def test_unrecorded_native_mount_is_not_adopted(self):
+        self.backend.actual[str(self.target)] = [native_identity(self.target, self.source)]
+        self.backend.sources[str(self.target)] = str(self.source)
+        with self.assertRaises(m.MountError):
+            self.execute(self.desired(), {})
+
+    def test_native_keep_checks_source_identity(self):
+        records = self.mount_initial()
+        self.backend.sources[str(self.target)] = str(self.other)
+        self.assertEqual(self.execute(self.desired(), records), 1)
+        self.assertEqual(len(self.backend.calls), 1)
+
+    def test_new_mount_must_refer_to_same_file(self):
+        records = {}
+        with patch.object(self.backend, "samefile", return_value=False):
+            self.assertEqual(self.execute(self.desired(), records), 1)
+        self.assertIsNone(records[str(self.target)]["mount"])
 
     def test_mount_failure_does_not_record_success(self):
         records = {}
@@ -252,6 +314,133 @@ class MountctlTests(unittest.TestCase):
         store.path.write_text("broken")
         with self.assertRaises(m.MountError):
             store.load()
+
+    def write_legacy_state(self, config, records):
+        store = m.StateStore(config)
+        store.directory.mkdir(parents=True, exist_ok=True)
+        key = m.hashlib.sha256(str(config).encode()).hexdigest()
+        path = store.directory / (key + ".json")
+        path.write_text(json.dumps({"version": 1, "config": str(config), "records": records}))
+        return path
+
+    def test_config_rename_keeps_same_state_path(self):
+        old = m.StateStore(self.config)
+        renamed = m.StateStore(self.project / "mounts_112.json")
+        self.assertEqual(old.path, renamed.path)
+
+    def test_different_projects_keep_separate_state_with_shared_base(self):
+        base = self.base / "state"
+        first = m.StateStore(self.config, base)
+        second = m.StateStore(self.base / "project2/mounts.json", base)
+        self.assertNotEqual(first.path, second.path)
+
+    def test_rename_recovers_and_migrates_legacy_records_without_remount(self):
+        records = self.mount_initial()
+        legacy = self.write_legacy_state(self.config, records)
+        self.write_config()
+        renamed = self.project / "mounts_112.json"
+        self.config.rename(renamed)
+        with patch.object(m, "SystemBackend", return_value=self.backend), patch("builtins.print"):
+            self.assertEqual(m.main(["sync", str(renamed)]), 0)
+        store = m.StateStore(renamed)
+        self.assertEqual(store.load(), records)
+        self.assertEqual(len(self.backend.calls), 1)
+        self.assertFalse(legacy.exists())
+        data = json.loads(store.path.read_text())
+        self.assertEqual(data["version"], 3)
+        self.assertEqual(data["config"], str(renamed))
+
+    def test_rename_dry_run_reads_legacy_without_migrating(self):
+        records = self.mount_initial()
+        legacy = self.write_legacy_state(self.config, records)
+        before = legacy.read_bytes()
+        self.write_config()
+        renamed = self.project / "mounts_112.json"
+        self.config.rename(renamed)
+        with patch.object(m, "SystemBackend", return_value=self.backend), patch("builtins.print"):
+            self.assertEqual(m.main(["sync", str(renamed), "--dry-run"]), 0)
+        self.assertEqual(legacy.read_bytes(), before)
+        self.assertFalse(m.StateStore(renamed).path.exists())
+        self.assertEqual(len(self.backend.calls), 1)
+
+    def test_renamed_empty_config_removes_previously_managed_mounts(self):
+        records = self.mount_initial()
+        legacy = self.write_legacy_state(self.config, records)
+        self.write_config([])
+        renamed = self.project / "mounts_112.json"
+        self.config.rename(renamed)
+        with patch.object(m, "SystemBackend", return_value=self.backend), patch("builtins.print"):
+            self.assertEqual(m.main(["sync", str(renamed)]), 0)
+        self.assertEqual(m.StateStore(renamed).load(), {})
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.backend.calls[-1], ("unmount", str(self.target)))
+
+    def test_conflicting_legacy_records_do_not_get_silently_merged(self):
+        records = self.mount_initial()
+        self.write_legacy_state(self.config, records)
+        other = copy.deepcopy(records)
+        other[str(self.target)]["source"] = str(self.other)
+        self.write_legacy_state(self.project / "other.json", other)
+        store = m.StateStore(self.project / "renamed.json")
+        with self.assertRaises(m.MountError):
+            store.load()
+        self.assertFalse(store.path.exists())
+
+    def test_committed_state_wins_if_legacy_cleanup_was_interrupted(self):
+        records = self.mount_initial()
+        store = m.StateStore(self.config)
+        with store.lock():
+            store.save({})
+        legacy = self.write_legacy_state(self.config, records)
+        with store.lock():
+            self.assertEqual(store.load(), {})
+            store.save({})
+        self.assertFalse(legacy.exists())
+
+    def test_version_two_fuse_state_can_be_loaded_for_migration(self):
+        records = self.mount_legacy()
+        store = m.StateStore(self.config)
+        with store.lock():
+            store.path.write_text(json.dumps({
+                "version": 2, "project": str(self.project),
+                "config": str(self.config), "records": records,
+            }))
+            self.assertEqual(store.load(), records)
+
+    def test_backend_uses_only_native_mount_commands(self):
+        backend = m.SystemBackend()
+        with patch.object(m.os, "geteuid", return_value=2015), \
+                patch.object(backend, "check_source"), patch.object(backend, "run") as run:
+            backend.mount(str(self.source), str(self.target))
+            backend.unmount(str(self.target))
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["sudo", "-n", "mount", "--bind", "--", str(self.source), str(self.target)],
+            ["sudo", "-n", "umount", "--", str(self.target)],
+        ])
+
+    def test_backend_rejects_fuse_source(self):
+        backend = m.SystemBackend()
+        mounts = {str(self.source): [identity(self.source, "some-fuse")]}
+        with patch.object(backend, "mounts", return_value=mounts), self.assertRaises(m.MountError):
+            backend.check_source(str(self.source))
+
+    def test_sudo_failure_happens_before_any_mount_change(self):
+        backend = m.SystemBackend()
+        actions = [m.Action("unmount", str(self.target))]
+        with patch.object(m.os, "geteuid", return_value=2015), \
+                patch.object(m.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), \
+                patch.object(m.subprocess, "run", return_value=m.subprocess.CompletedProcess([], 1)), \
+                patch.object(backend, "privileged_run") as run, self.assertRaises(m.MountError):
+            backend.preflight(actions)
+        run.assert_not_called()
+
+    def test_passwordless_sudo_does_not_require_sudo_validate(self):
+        backend = m.SystemBackend()
+        with patch.object(m.os, "geteuid", return_value=2015), \
+                patch.object(m.shutil, "which", side_effect=lambda name: "/usr/bin/" + name), \
+                patch.object(m.subprocess, "run", return_value=m.subprocess.CompletedProcess([], 0)) as run:
+            backend.preflight([m.Action("unmount", str(self.target))])
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["sudo", "-n", "true"]])
 
     def test_default_state_is_beside_config_even_with_xdg_override(self):
         with patch.dict("os.environ", {"XDG_STATE_HOME": str(self.base / "elsewhere")}):

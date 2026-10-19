@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Map selected paths in a compilation database to a symlinked source tree."""
+"""Map selected paths in a compilation database to another source-tree path."""
 
 import argparse
 import json
@@ -167,9 +167,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", type=Path, help="JSON file or directory to scan recursively")
     parser.add_argument("old_prefix", help="original path prefix (A); relative to current directory")
-    parser.add_argument("new_prefix", help="symlinked path prefix (B); relative to current directory")
+    parser.add_argument("new_prefix", help="replacement path prefix (B); relative to current directory")
     parser.add_argument("--output", type=Path,
                         help="output file, or output directory when the input is a directory")
+    parser.add_argument("--allow-different-tree", action="store_true",
+                        help="allow A and B to identify different directories (e.g. bindfs/FUSE); "
+                             "the caller must ensure B contains the intended source tree")
     args = parser.parse_args()
 
     # abspath normalizes relative paths without following B's symlink.
@@ -177,10 +180,13 @@ def main():
     new = os.path.abspath(os.path.expanduser(args.new_prefix))
     if not os.path.isdir(new):
         parser.error(f"new prefix is not an existing directory: {new}")
-    if os.path.exists(old) and not os.path.samefile(old, new):
+    if (not args.allow_different_tree and os.path.exists(old)
+            and not os.path.samefile(old, new)):
         parser.error(
             f"A resolves to {os.path.realpath(old)}, but B resolves to "
-            f"{os.path.realpath(new)}; choose B's resolved directory as A"
+            f"{os.path.realpath(new)}; A and B must identify the same directory. "
+            "For an intentional mapping to a different directory or bindfs/FUSE view, "
+            "use --allow-different-tree"
         )
 
     source = args.database

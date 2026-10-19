@@ -1,24 +1,17 @@
 # 工程目录挂载工具
 
-`tools/mountctl.py` 读取工程的挂载声明，在本机建立 `bindfs` 目录视图。
+`tools/mountctl.py` 读取工程的挂载声明，在本机执行内核原生 `mount --bind`。
 不同工程可以使用同一份 SDK，同时让 clangd 看到各自工程内的路径。
 工具只在手动调用时更新，不监听文件，不添加服务、定时任务或开机任务。
 
 ## 使用
 
-需要 Linux、Python 3.8+、`bindfs`，以及可以访问的 `/dev/fuse`。
-Ubuntu / Debian 首次安装依赖：
-
-```bash
-sudo apt install bindfs
-```
-
-之后以日常使用的用户运行，不加 `sudo`：
+需要 Linux、Python 3.8+ 和 util-linux 提供的 `mount`、`umount`。
+不需要 `bindfs`、`fusermount` 或 `/dev/fuse`，也不创建任何 FUSE 挂载。
+以日常使用的用户运行整个脚本，脚本仅在挂载、卸载时通过 `sudo` 提权：
 
 ```bash
 cd /path/to/EdgeFabric
-# 首次配置，已有 mounts.json 时不要覆盖它：
-cp -n mounts.example.json mounts.json
 python3 tools/mountctl.py sync --dry-run
 python3 tools/mountctl.py sync
 ```
@@ -28,6 +21,20 @@ python3 tools/mountctl.py sync
 ```bash
 python3 tools/mountctl.py sync /path/to/project/mounts.json
 ```
+
+文件名可以自定，例如改名后使用：
+
+```bash
+python3 tools/mountctl.py sync mounts_112.json --dry-run
+python3 tools/mountctl.py sync mounts_112.json
+```
+
+不传文件名时仍只读取 `mounts.json`，不会猜测应使用哪份 JSON 文件。
+首次需要变更挂载时会检查 sudo 权限；已有免密权限或有效凭据时直接执行，
+否则执行 `sudo -v`，可能要求输入密码。认证失败不会修改挂载。
+状态文件仍由普通用户写入，避免 NFS 的 root squash 导致管理员不能写工程目录。
+不要为了挂载权限给整个 Python 脚本加 `sudo`，否则会切换到 root 的状态记录。
+只做预览或检查已经正确的挂载时无需 sudo。
 
 从哪里执行命令都可以，相对路径以**配置文件所在目录**为基准。
 `--dry-run` 检查并显示计划，不写状态、不创建目录、不执行挂载。
@@ -50,7 +57,7 @@ python3 tools/mountctl.py sync /path/to/project/mounts.json
 `target` 必须位于配置文件所在目录内部，不能是符号链接或经过符号链接。
 当前不支持嵌套的挂载目标、源与目标相互包含、挂载目标之间的依赖。
 
-仓库提供 `mounts.example.json`，本机的 `mounts.json` 已按该示例配置：
+本机 `mounts_112.json` 中的 NRF SDK 配置使用了以下相对位置：
 
 ```text
 ../../../ncs/v3.4.1
@@ -59,8 +66,8 @@ python3 tools/mountctl.py sync /path/to/project/mounts.json
 
 这利用了 SDK 和 EdgeFabric 在同一个共享 home 内的相对位置，因此无需写死
 `/home/liuyuxuan` 或 `/home/yx/server28_home`。目录布局不同的机器可以改用环境变量。
-当前 `.gitignore` 忽略运行配置 `mounts.json`；通过 NFS 共享时仍可直接使用同一文件。
-若通过 Git 分发配置，可共享示例文件，或另选一个未被忽略的配置文件名并显式传入。
+当前 `.gitignore` 忽略 `mounts*.json`；通过 NFS 共享时仍可直接使用同一文件。
+若通过 Git 分发配置，可另选一个未被忽略的配置文件名并显式传入。
 
 ## 更新与删除
 
@@ -75,6 +82,7 @@ python3 tools/mountctl.py sync /path/to/project/mounts.json
 | 手动卸载或重启后挂载消失 | 下次运行时重新建立 |
 | 目标存在其他挂载或非空目录 | 报错，不接管、不遮盖 |
 | 挂载忙碌、卸载失败 | 保留状态，下次调用重试 |
+| 旧版工具管理的 FUSE 挂载 | 校验身份后卸载，再建立原生 bind mount |
 
 明确移除这份配置管理的全部挂载：把配置改为以下内容，然后执行 `sync`。
 
@@ -88,6 +96,8 @@ python3 tools/mountctl.py sync /path/to/project/mounts.json
 
 已有手动 `mount --bind` 不会自动被接管。确认它是需要迁移的挂载后，先手动正常卸载，
 再调用工具。不要直接删除它的目录。其他客户端上的挂载不会被本机操作改变。
+原生 bind mount 沿用源文件系统的挂载传播规则；同一机器上的共享 peer 挂载中，
+同一次挂载事件可能显示为多个路径。工具只记录所声明目标的身份。
 
 ## 状态、隔离与中断恢复
 
@@ -96,7 +106,7 @@ python3 tools/mountctl.py sync /path/to/project/mounts.json
 
 ```text
 EdgeFabric/.mountctl/
-  <机器标识>/<UID>/<本次启动标识>/<挂载命名空间>/<配置路径哈希>.json
+  <机器标识>/<UID>/<本次启动标识>/<挂载命名空间>/project-<工程路径哈希>.json
 ```
 
 `.mountctl/` 已加入 `.gitignore`，不提交到 Git。即便工程在 NFS 上共享，
@@ -107,13 +117,30 @@ EdgeFabric/.mountctl/
 `XDG_STATE_HOME` 不再影响默认位置。挂载目标不能覆盖状态目录或位于状态目录内部。
 重启后原有挂载已经消失，旧启动的记录保留供查看，新启动按当前配置重新建立。
 
-配置文件的绝对路径是工程身份的一部分。移动或重命名配置前，先用旧配置的空列表
-卸载挂载；直接删除配置或状态文件不会卸载挂载，也会失去自动清理依据。
+工程身份取自配置文件所在目录，与文件名无关。同一目录内把 `mounts.json` 改名为
+`mounts_112.json` 不会丢失挂载记录，也不需要重新挂载。
+同一机器、同一工程的不同配置文件共享状态：每次传入的文件都代表该工程的完整目标列表，
+并非与其他配置叠加；本次列表中缺少的旧条目会被卸载。不同机器仍独立记账。
+
+旧版本按配置文件名存储的记录会自动读取，并在成功校验计划后的正式 `sync` 中迁移。
+`--dry-run` 只读取，不迁移文件。如果多份旧记录对同一目标有冲突，工具报错而不猜测。
+迁移只更新状态文件，不为了改名而重新挂载。
+
+将配置移到另一个目录仍会改变工程身份和相对路径基准，应先清理原工程的挂载。
+直接删除配置或状态文件不会卸载挂载，也会失去自动清理依据。
 
 工具使用锁避免同一状态目录内、同一用户和挂载命名空间的并发更新，原子写入状态。
-挂载前先记录操作意图，并为 FUSE 挂载设置唯一子类型标识；如果进程中断，下一次
-调用能识别已经成功建立、但尚未完成记账的挂载。卸载前再次检查挂载 ID 和身份，
-避免误卸载后来叠加或替换的挂载。
+挂载前先记录操作意图，挂载成功后检查 `os.path.samefile(source, target)`，
+再保存挂载 ID、设备、文件系统根等完整身份信息。卸载前再次核对身份，
+避免误卸载后来叠加或替换的挂载；单凭 `samefile()` 相同不会接管外部挂载。
+
+原生 bind mount 无法携带旧 FUSE 方案的唯一标签。如果进程恰好在挂载成功后、
+保存挂载 ID 前中断，下次会报告“原生挂载缺少完成记录”，而不会猜测这个挂载的归属。
+确认目标后，手动 `sudo umount /目标目录`，再执行 `sync` 即可重新建立和记录。
+如果只写入了意图而实际挂载并未发生，下次会自动清理意图并重试。
+
+状态格式升级为 version 3，仍能读取版本 1、2 的记录。旧 FUSE 记录仅用于验证和
+卸载旧挂载，忙碌时保留原记录；所有新建挂载都使用原生 bind。
 
 一次同步并非整体事务：已经成功的操作保留，失败项报告错误，不回滚其他成功项。
 退出码为 `0` 表示成功，`1` 表示有错误，`130` 表示用户中断。
@@ -121,11 +148,13 @@ EdgeFabric/.mountctl/
 
 ## 与 clangd 和文件权限的关系
 
-工具使用 `bindfs --no-allow-other`，挂载只供运行工具的用户使用。
-源目录必须已经对该用户可访问；它不提供 NFS UID 转换，也不修改源文件的属主或权限。
-本机可以直接使用已经映射给 `yx` 的 `/home/yx/server28_home` 作为来源。
+工具执行 `sudo mount --bind 源目录 目标目录` 和 `sudo umount 目标目录`。
+源和目标是同一文件系统对象，设备号与 inode 相同，`os.path.samefile()` 应为 True。
+权限与源目录一致，不提供 UID 映射，也不会将访问限制到挂载发起者。
+源目录必须已经对日常用户可访问；本机 `yx` 的 UID 已与 NFS 属主统一。
+如果源目录本身仍处于 FUSE 文件系统，工具会报错，避免间接保留 FUSE 转发开销。
 
-FUSE 挂载不是符号链接，`realpath` 不会将目标目录展开成源目录。
+bind mount 不是符号链接，`realpath` 不会将目标目录展开成源目录。
 各工程仍需自己的 `.clangd` 和编译数据库；本工具只管理挂载，**不改写
 `compile_commands.json`**。已有数据库改写脚本应在挂载建立后使用同样的路径映射。
 SDK 内部原本就存在的符号链接仍保持其原有行为，工具不会重写它们。
@@ -137,7 +166,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 单元测试不要求挂载权限，覆盖同步差异、身份冲突、忙碌挂载、状态损坏、中断恢复和
-只读预览。在宿主机以普通用户执行真实 FUSE 集成测试：
+只读预览。在宿主机以有 sudo 挂载权限的普通用户执行真实 bind mount 集成测试：
 
 ```bash
 python3 -B tests/integration_mountctl.py

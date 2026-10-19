@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile explicitly declared, per-project bindfs mounts on Linux."""
+"""Reconcile explicitly declared, native Linux bind mounts per project."""
 
 import argparse
 from contextlib import contextmanager
@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 
 
 class MountError(Exception):
@@ -114,6 +113,13 @@ def parse_mountinfo(contents):
 
 
 def owned_mount(record, actual):
+    if record.get("backend") == "bind":
+        # A bind mount has no private filesystem tag. Only a recorded mount
+        # identity proves ownership; samefile() alone would also match a mount
+        # somebody else created at the same path.
+        return record["mount"] is not None and record["mount"] == actual
+    # Read-only compatibility for identifying and removing old tool-created
+    # FUSE mounts. New mounts never use FUSE.
     return (
         actual["fstype"] == "fuse." + record["token"]
         and actual["root"] == "/"
@@ -141,9 +147,10 @@ class StateStore:
         self.base = Path(base).expanduser().absolute()
         machine, boot, namespace = scope_id()
         self.directory = self.base / machine / str(os.getuid()) / boot / namespace
-        key = hashlib.sha256(str(config).encode()).hexdigest()
-        self.path = self.directory / (key + ".json")
+        key = hashlib.sha256(str(config.parent).encode()).hexdigest()
+        self.path = self.directory / ("project-" + key + ".json")
         self.config = config
+        self.legacy_paths = []
 
     def check_targets(self, targets):
         state_root = self.base.resolve()
@@ -163,22 +170,56 @@ class StateStore:
             yield
 
     def load(self):
-        if not self.path.exists():
-            return {}
-        data = read_json(self.path)
-        if (not isinstance(data, dict) or data.get("version") != 1
-                or data.get("config") != str(self.config)
-                or not isinstance(data.get("records"), dict)):
-            raise MountError(f"状态文件格式不正确，拒绝执行: {self.path}")
-        records = data["records"]
+        records = None
+        if self.path.exists():
+            data = read_json(self.path)
+            if (not isinstance(data, dict) or data.get("version") not in (2, 3)
+                    or data.get("project") != str(self.config.parent)
+                    or not isinstance(data.get("config"), str)
+                    or Path(data["config"]).parent != self.config.parent):
+                raise MountError(f"状态文件格式不正确，拒绝执行: {self.path}")
+            records = self.validate_records(data.get("records"))
+
+        # Older versions keyed state by the config filename. Recognize those
+        # records even after that file was renamed; dry-run must not rewrite them.
+        self.legacy_paths = []
+        legacy_records = {}
+        for path in sorted(self.directory.glob("*.json")):
+            if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+                continue
+            data = read_json(path)
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or not isinstance(data.get("config"), str)
+                    or not Path(data["config"]).is_absolute()):
+                raise MountError(f"旧状态文件格式不正确，拒绝执行: {path}")
+            if Path(data["config"]).parent != self.config.parent:
+                continue
+            old = self.validate_records(data.get("records"))
+            self.legacy_paths.append(path)
+            # A successfully committed v2 file is authoritative if a process
+            # stopped before deleting its v1 inputs.
+            if records is not None:
+                continue
+            for target, record in old.items():
+                if target in legacy_records and legacy_records[target] != record:
+                    raise MountError(f"多个旧配置对同一目标的记录冲突，拒绝自动合并: {target}")
+                legacy_records[target] = record
+        return records if records is not None else legacy_records
+
+    def validate_records(self, records):
+        if not isinstance(records, dict):
+            raise MountError("状态文件中的 records 必须是对象")
         for target, record in records.items():
+            native = isinstance(record, dict) and record.get("backend") == "bind"
+            expected = {"target", "source", "mount", "backend" if native else "token"}
             if (not isinstance(record, dict)
-                    or set(record) != {"target", "source", "token", "mount"}
+                    or set(record) != expected
                     or record["target"] != target
                     or not isinstance(record["source"], str)
                     or not Path(record["source"]).is_absolute()
-                    or not isinstance(record["token"], str)
-                    or not re.fullmatch(TOKEN_PREFIX + r"[0-9a-f]{32}", record["token"])):
+                    or (not native and (
+                        not isinstance(record["token"], str)
+                        or not re.fullmatch(TOKEN_PREFIX + r"[0-9a-f]{32}", record["token"])))):
                 raise MountError(f"状态记录损坏: {target}")
             target_path = Path(target)
             if not target_path.is_absolute() or str(Path(os.path.abspath(target))) != target:
@@ -188,13 +229,18 @@ class StateStore:
             if identity is not None and (
                 not isinstance(identity, dict) or set(identity) != set(IDENTITY_KEYS)
                 or not all(isinstance(v, str) for v in identity.values())
-                or identity["target"] != target or identity["fstype"] != "fuse." + record["token"]
+                or identity["target"] != target
+                or (native and identity["fstype"].startswith("fuse"))
+                or (not native and identity["fstype"] != "fuse." + record["token"])
             ):
                 raise MountError(f"挂载身份记录损坏: {target}")
         return records
 
     def save(self, records):
-        data = {"version": 1, "config": str(self.config), "records": records}
+        data = {
+            "version": 3, "project": str(self.config.parent),
+            "config": str(self.config), "records": records,
+        }
         fd, temporary = tempfile.mkstemp(prefix=".state-", dir=self.directory)
         try:
             with os.fdopen(fd, "w") as stream:
@@ -205,6 +251,12 @@ class StateStore:
             os.replace(temporary, self.path)
             directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
+                os.fsync(directory_fd)
+                # Commit the new state durably before removing legacy records.
+                for path in self.legacy_paths:
+                    if path.exists():
+                        path.unlink()
+                self.legacy_paths = []
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
@@ -227,19 +279,25 @@ def make_plan(desired, records, actual):
         entries = actual.get(target, [])
         if not entries:
             actions.append(Action("forget", target))
+        elif record.get("backend") == "bind" and record["mount"] is None:
+            raise MountError(
+                f"原生挂载缺少完成记录，无法确认身份: {target}；"
+                "请核对后手动正常卸载该目标，再执行 sync"
+            )
         elif len(entries) != 1 or not owned_mount(record, entries[0]):
             raise MountError(f"挂载已被替换或叠加，拒绝操作: {target}")
         else:
             managed[target] = record
     for target, record in managed.items():
-        if desired.get(target) != record["source"]:
+        if desired.get(target) != record["source"] or record.get("backend") != "bind":
             actions.append(Action("unmount", target, record["source"]))
         else:
             actions.append(Action("keep", target, record["source"]))
     for target, source in desired.items():
         if target in actual and target not in managed:
             raise MountError(f"目标已有非本工具管理的挂载，拒绝接管: {target}")
-        if target not in managed or managed[target]["source"] != source:
+        if (target not in managed or managed[target]["source"] != source
+                or managed[target].get("backend") != "bind"):
             actions.append(Action("mount", target, source))
     removing = {a.target for a in actions if a.kind == "unmount"}
     for action in actions:
@@ -265,17 +323,41 @@ class SystemBackend:
         return parse_mountinfo(Path("/proc/self/mountinfo").read_text())
 
     def preflight(self, actions):
-        if any(a.kind == "mount" for a in actions):
-            if not shutil.which("bindfs"):
-                raise MountError("找不到 bindfs，请先安装：sudo apt install bindfs")
-            if not os.access("/dev/fuse", os.R_OK | os.W_OK):
-                raise MountError("无法访问 /dev/fuse；请在有 FUSE 权限的宿主机终端运行")
-        if any(a.kind == "unmount" for a in actions) and not self.unmounter():
-            raise MountError("找不到 fusermount3 或 fusermount")
+        changes = [a for a in actions if a.kind in {"mount", "unmount"}]
+        for action in changes:
+            command = "mount" if action.kind == "mount" else "umount"
+            if not shutil.which(command):
+                raise MountError(f"找不到 {command}，请安装 util-linux")
+            if action.kind == "mount":
+                self.check_source(action.source)
+        if changes and os.geteuid() != 0:
+            if not shutil.which("sudo"):
+                raise MountError("原生挂载需要管理员权限，请安装并配置 sudo")
+            # sudo -v can still require a password with mixed PASSWD/NOPASSWD
+            # rules, even when actual commands are permitted without one.
+            ready = subprocess.run(
+                ["sudo", "-n", "true"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            if not ready and subprocess.run(["sudo", "-v"]).returncode:
+                raise MountError("sudo 认证失败，未修改任何挂载")
+
+    def check_source(self, source):
+        path = Path(source)
+        ancestors = [
+            (len(Path(target).parts), entries[-1])
+            for target, entries in self.mounts().items()
+            if path == Path(target) or beneath(path, Path(target))
+        ]
+        if not ancestors:
+            raise MountError(f"无法识别源目录所在文件系统: {source}")
+        filesystem = max(ancestors, key=lambda entry: entry[0])[1]
+        if filesystem["fstype"].startswith("fuse"):
+            raise MountError(f"源目录本身仍位于 FUSE 文件系统，请先更换来源: {source}")
 
     @staticmethod
-    def unmounter():
-        return shutil.which("fusermount3") or shutil.which("fusermount")
+    def samefile(source, target):
+        return os.path.samefile(source, target)
 
     @staticmethod
     def run(args):
@@ -283,19 +365,17 @@ class SystemBackend:
         if result.returncode:
             raise MountError((result.stderr or result.stdout).strip() or f"命令失败: {args[0]}")
 
-    def mount(self, source, target, token):
-        self.run([
-            "bindfs", "--no-allow-other", "--create-as-mounter",
-            # bindfs 1.14 appends its own FUSE flags after the paths, so a
-            # literal '--' here breaks its single-threaded '-s' option.
-            # Both paths are validated absolute paths and cannot be options.
-            # bindfs can overwrite fsname when the source has no special
-            # characters. A unique subtype is preserved for all source paths.
-            "-o", f"subtype={token}", source, target,
-        ])
+    def privileged_run(self, args):
+        if os.geteuid() != 0:
+            args = ["sudo", "-n", *args]
+        self.run(args)
+
+    def mount(self, source, target):
+        self.check_source(source)
+        self.privileged_run(["mount", "--bind", "--", source, target])
 
     def unmount(self, target):
-        self.run([self.unmounter(), "-u", "--", target])
+        self.privileged_run(["umount", "--", target])
 
 
 def execute_plan(actions, records, store, backend, emit=print):
@@ -316,9 +396,8 @@ def execute_plan(actions, records, store, backend, emit=print):
                 if len(entries) != 1 or not owned_mount(record, entries[0]):
                     raise MountError("挂载身份发生变化，拒绝操作")
                 if action.kind == "keep":
-                    if record["mount"] is None:
-                        record["mount"] = entries[0]
-                        store.save(records)
+                    if not backend.samefile(record["source"], target):
+                        raise MountError("源目录已改变，当前源和目标不是同一目录；请核对后重新挂载")
                 else:
                     if any(beneath(Path(p), Path(target)) for p in actual):
                         raise MountError("目标内还有挂载；先处理子挂载")
@@ -340,21 +419,22 @@ def execute_plan(actions, records, store, backend, emit=print):
                     raise MountError("目标非空，拒绝遮盖已有文件")
                 record = {
                     "source": action.source, "target": target,
-                    "token": TOKEN_PREFIX + uuid.uuid4().hex, "mount": None,
+                    "backend": "bind", "mount": None,
                 }
-                # Write intent before invoking FUSE: a killed process can recover
-                # its own mount by this unique subtype on the next invocation.
+                # A crash before recording the resulting mount ID must fail
+                # closed on the next run, rather than adopt a foreign mount.
                 records[target] = record
                 store.save(records)
                 try:
-                    backend.mount(action.source, target, record["token"])
+                    backend.mount(action.source, target)
                 except (MountError, OSError):
                     if not backend.mounts().get(target):
                         del records[target]
                         store.save(records)
                     raise
                 entries = backend.mounts().get(target, [])
-                if len(entries) != 1 or not owned_mount(record, entries[0]):
+                if (len(entries) != 1 or entries[0]["fstype"].startswith("fuse")
+                        or not backend.samefile(action.source, target)):
                     raise MountError("未能验证新挂载；保留操作记录供下次检查")
                 record["mount"] = entries[0]
                 store.save(records)
@@ -369,7 +449,7 @@ def execute_plan(actions, records, store, backend, emit=print):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="手动同步工程声明的 bindfs 挂载；不监听、不定时运行。")
+    parser = argparse.ArgumentParser(description="手动同步原生 mount --bind 挂载；普通用户运行，挂载操作通过 sudo 提权。")
     parser.add_argument("command", choices=["sync"])
     parser.add_argument("config", nargs="?", default="mounts.json", help="默认读取当前目录的 mounts.json")
     parser.add_argument("--dry-run", action="store_true", help="只显示计划，不创建目录、状态或挂载")
@@ -394,6 +474,8 @@ def main(argv=None):
             store.check_targets(records)
             actions = make_plan(desired, records, backend.mounts())
             backend.preflight(actions)
+            # Also persist a rename/legacy migration when all mounts are KEEP.
+            store.save(records)
             failures = execute_plan(actions, records, store, backend)
         print(f"同步完成，失败 {failures} 项。状态文件: {store.path}")
         return 1 if failures else 0
