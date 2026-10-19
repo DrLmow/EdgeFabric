@@ -9,3 +9,9 @@ tmp/
 build/
 build*/
 
+__pycache__/
+mounts.json
+
+*.code-workspace
+
+.mountctl/
