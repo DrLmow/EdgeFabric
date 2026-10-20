@@ -163,13 +163,26 @@ def write_database(destination, entries, mode_source):
             temporary.unlink(missing_ok=True)
 
 
+def output_destination(path):
+    """An existing directory or a new path without .json names an output directory."""
+    if path.exists():
+        if path.is_dir():
+            return path / "compile_commands.json", path
+        if path.is_file():
+            return path, None
+        raise ValueError(f"output is neither a file nor a directory: {path}")
+    if path.suffix.lower() == ".json":
+        return path, None
+    return path / "compile_commands.json", path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", type=Path, help="JSON file or directory to scan recursively")
     parser.add_argument("old_prefix", help="original path prefix (A); relative to current directory")
     parser.add_argument("new_prefix", help="replacement path prefix (B); relative to current directory")
     parser.add_argument("--output", type=Path,
-                        help="output file, or output directory when the input is a directory")
+                        help="directory for compile_commands.json, or an explicit .json file")
     parser.add_argument("--allow-different-tree", action="store_true",
                         help="allow A and B to identify different directories (e.g. bindfs/FUSE); "
                              "the caller must ensure B contains the intended source tree")
@@ -189,6 +202,11 @@ def main():
             "use --allow-different-tree"
         )
 
+    try:
+        destination, output_dir = output_destination(args.output) if args.output else (None, None)
+    except ValueError as error:
+        parser.error(str(error))
+
     source = args.database
     if source.is_file():
         files = [source]
@@ -196,8 +214,8 @@ def main():
     elif source.is_dir():
         scanning = True
         files = sorted(source.rglob("*.json"))
-        if args.output:
-            output_root = args.output.absolute()
+        if output_dir:
+            output_root = output_dir.absolute()
             source_root = source.absolute()
             if output_root != source_root and output_root.is_relative_to(source_root):
                 files = [path for path in files if not path.absolute().is_relative_to(output_root)]
@@ -206,13 +224,9 @@ def main():
     else:
         parser.error(f"input is neither a file nor a directory: {source}")
 
-    if args.output and scanning and args.output.exists() and not args.output.is_dir():
-        parser.error("--output must be a directory when the input is a directory")
-    if args.output and not scanning and args.output.is_dir():
-        parser.error("--output must be a file when the input is a file")
-
     databases = skipped = changed_files = changed_entries = 0
     errors = []
+    rewritten = []
     for path in files:
         try:
             with path.open(encoding="utf-8") as stream:
@@ -226,23 +240,13 @@ def main():
                 continue
             changed = rewrite_database(entries, old, new)
             databases += 1
-            if args.output or changed:
-                destination = (args.output / path.relative_to(source) if scanning and args.output
-                               else args.output or path)
-                write_database(destination, entries, path)
+            rewritten.append((path, entries, changed))
             if changed:
                 changed_files += 1
                 changed_entries += changed
-                print(f"Updated {changed} of {len(entries)} entries: {path}")
         except (OSError, ValueError) as error:
             errors.append(f"{path}: {error}")
 
-    if scanning:
-        print(f"Scanned {len(files)} JSON files: {databases} compilation databases, "
-              f"{skipped} other JSON files; updated {changed_entries} entries in "
-              f"{changed_files} compilation databases")
-    elif not errors and not changed_files:
-        print(f"Updated 0 of {len(entries)} entries: {source}")
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
     if errors:
@@ -250,6 +254,27 @@ def main():
     if scanning and not databases:
         print(f"error: no compilation databases found under {source}", file=sys.stderr)
         return 1
+
+    try:
+        if destination:
+            combined = [entry for _, entries, _ in rewritten for entry in entries]
+            write_database(destination, combined, rewritten[0][0])
+            print(f"Wrote {len(combined)} entries to {destination}")
+        else:
+            for path, entries, changed in rewritten:
+                if changed:
+                    write_database(path, entries, path)
+                    print(f"Updated {changed} of {len(entries)} entries: {path}")
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    if scanning:
+        print(f"Scanned {len(files)} JSON files: {databases} compilation databases, "
+              f"{skipped} other JSON files; updated {changed_entries} entries in "
+              f"{changed_files} compilation databases")
+    elif not destination and not changed_files:
+        print(f"Updated 0 of {len(rewritten[0][1])} entries: {source}")
     return 0
 
 
